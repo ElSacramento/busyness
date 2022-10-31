@@ -2,6 +2,7 @@ package busyness
 
 import (
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -16,82 +17,96 @@ day2	1		1		1
 day3	1		0		1
 */
 type Busyness struct {
-	minInterval time.Duration
+	interval    time.Duration
 	startDate   time.Time
+	dayBytesLen int
 
 	rwLock *sync.RWMutex
-	value  [][]byte
+	value  []byte
 }
 
-func NewBusyness(storedLen, storedCap int, minInterval time.Duration) *Busyness {
-	value := make([][]byte, storedLen, storedCap)
+const (
+	minPossibleInterval = time.Minute * 15
+	maxPossibleInterval = time.Hour * 3
+	bitsLen             = 8
+)
 
-	var dayIntervalsNumber = 24 * time.Hour / minInterval
-	for i := 0; i < len(value); i++ {
-		value[i] = make([]byte, dayIntervalsNumber)
+func NewBusyness(storedDays int, interval time.Duration) (*Busyness, error) {
+	if interval < minPossibleInterval {
+		return nil, errors.New("too small interval")
 	}
+	if interval > maxPossibleInterval {
+		return nil, errors.New("too big interval")
+	}
+
+	// for interval=30min we need 48bits = 6bytes
+	// for 7 days we need 6bytes*7 = 42bytes
+	bytesNumberForDay := int((24 * time.Hour / interval) / bitsLen)
+	value := make([]byte, bytesNumberForDay*storedDays, bytesNumberForDay*(storedDays+1))
 
 	year, month, day := time.Now().Date()
 	startDate := time.Date(year, month, day, 0, 0, 0, 0, time.Now().Location())
 
 	return &Busyness{
-		minInterval: minInterval,
+		interval:    interval,
 		value:       value,
 		startDate:   startDate,
+		dayBytesLen: bytesNumberForDay,
 		rwLock:      &sync.RWMutex{},
-	}
+	}, nil
 }
 
-func (b *Busyness) getStartDate() time.Time {
-	return b.startDate
+func isEqualDate(t1, t2 time.Time) bool {
+	return t1.Year() == t2.Year() && t1.Month() == t2.Month() && t1.Day() == t2.Day()
 }
 
-func isEqualDate(time1, time2 time.Time) bool {
-	year1, month1, day1 := time1.Date()
-	year2, month2, day2 := time2.Date()
-	return year1 == year2 && month1 == month2 && day1 == day2
+func (b *Busyness) geStoredBitsLen() int {
+	return len(b.value) * bitsLen
 }
 
-func (b *Busyness) getRowsLen() int {
-	return len(b.value)
-}
-
-func (b *Busyness) getColumnsLen() int {
-	return len(b.value[0])
-}
-
-func (b *Busyness) getRowIndex(t time.Time) int {
-	index := int(t.Sub(b.startDate).Hours() / 24)
+func (b *Busyness) getBitIndex(t time.Time) int {
+	index := int(t.Sub(b.startDate).Minutes() / b.interval.Minutes())
 	if index < 0 {
 		return -1
 	}
 	return index
 }
 
-func (b *Busyness) getColumnIndex(t time.Time) int {
-	index := (t.Hour()*60 + t.Minute()) / int(b.minInterval.Minutes())
-	if index < 0 || index >= b.getColumnsLen() {
-		return -1
+func (b *Busyness) getTimeFromIndex(index int) time.Time {
+	return b.startDate.Add(time.Duration(index * int(b.interval)))
+}
+
+func (b *Busyness) getMeetingLength(m *Meeting) (int, error) {
+	fromIndex := b.getBitIndex(m.from)
+	toIndex := b.getBitIndex(m.to)
+
+	if fromIndex == -1 || toIndex == -1 {
+		return 0, errors.New("wrong fromDay or toDay time")
 	}
-	return index
+
+	return toIndex - fromIndex, nil
 }
 
-func (b *Busyness) getTimeFromRowColumn(row, column int) time.Time {
-	return b.startDate.Add(24*time.Hour*time.Duration(row) + b.minInterval*time.Duration(column))
-}
+func (b *Busyness) getStartIndexes(m *Meeting) ([]int, error) {
+	fromIndex := b.getBitIndex(m.from)
+	if fromIndex >= b.geStoredBitsLen() {
+		return nil, errors.New("event is out of the period")
+	}
 
-func (b *Busyness) getReccurentRowsIDs(rule *rrule.RRule) ([]int, error) {
+	if m.rule == nil {
+		return []int{fromIndex}, nil
+	}
+
 	indexes := make([]int, 0)
-
-	iterValue := rule.Iterator() // complexity?
+	iterValue := m.rule.Iterator() // complexity?
 	event, hasNext := iterValue()
 	for hasNext {
-		index := b.getRowIndex(event)
+		index := b.getBitIndex(event)
 		if index == -1 {
 			return nil, errors.New("wrong day")
 		}
 
-		if index >= b.getRowsLen() {
+		if index >= b.geStoredBitsLen() {
 			return indexes, nil
 		}
 
@@ -102,90 +117,139 @@ func (b *Busyness) getReccurentRowsIDs(rule *rrule.RRule) ([]int, error) {
 	return indexes, nil
 }
 
-func (b *Busyness) getColumnsInterval(m *Meeting) (pairInt, error) {
-	fromColumn := b.getColumnIndex(m.from)
-	toColumn := b.getColumnIndex(m.to)
-
-	if fromColumn == -1 || toColumn == -1 {
-		return pairInt{}, errors.New("impossible time of the day")
-	}
-	return pairInt{fromColumn, toColumn - 1}, nil
+func getByteIndexes(index int) (int, int) {
+	div := index / bitsLen
+	mod := index % bitsLen
+	return div, mod
 }
 
-func (b *Busyness) getRowsIndexes(m *Meeting) ([]int, error) {
-	indexes := make([]int, 0)
-	if m.rule == nil {
-		fromRow := b.getRowIndex(m.from)
+type ByteInfo struct {
+	index    int
+	value    byte
+	startBit int
+	// endBit   int
+}
 
-		if fromRow == -1 {
-			return nil, errors.New("wrong fromDay")
+func convertToBytes(startBitIndexes []int, sequenceLength int) []ByteInfo {
+	expectedBytes := make([]ByteInfo, 0)
+	// max(O(n*k), O(n*8)), if k > 0 , rare situations
+	// O(n*8)
+	for _, i := range startBitIndexes {
+		byteFromIndex, bitFromIndex := getByteIndexes(i)
+		bitToIndex := bitFromIndex + sequenceLength - 1
+		byteToIndex := byteFromIndex
+		for bitToIndex >= bitsLen {
+			byteToIndex += 1
+			bitToIndex -= bitsLen
 		}
 
-		if fromRow >= b.getRowsLen() {
-			return nil, errors.New("event is out of the period")
-		}
-
-		toRow := fromRow
-
-		if !isEqualDate(m.from, m.to) {
-			// event that starts today and will be finished tomorrow
-			toRow = b.getRowIndex(m.to)
-
-			if toRow == -1 {
-				return nil, errors.New("wrong toDay")
+		if byteFromIndex == byteToIndex {
+			// create 00001110
+			// sequenceLength = 3
+			// bitFromIndex = 4, bitToIndex = 6
+			res := byte(1)
+			for i := 0; i < bitToIndex-bitFromIndex; i++ {
+				res = res << 1
+				res = res + byte(1)
 			}
+			// now we have 00000111
+			res = res << byte(bitsLen-bitToIndex-1)
+			// now we have 00001110
+			expectedBytes = append(expectedBytes, ByteInfo{
+				index:    byteFromIndex,
+				value:    res,
+				startBit: bitFromIndex,
+				// endBit:   bitToIndex,
+			})
+			continue
 		}
 
-		for i := fromRow; i <= toRow && i < b.getRowsLen(); i++ {
-			indexes = append(indexes, i)
+		// create 00000011 and 11000000
+		// sequenceLength = 4
+		// bitFromIndex = 6, bitToIndex = 1
+		res := byte(1)
+		for i := 0; i < bitsLen-bitFromIndex-1; i++ {
+			res = res << 1
+			res = res + byte(1)
 		}
-		return indexes, nil
-	}
+		// now we have 00000011
+		expectedBytes = append(expectedBytes, ByteInfo{
+			index:    byteFromIndex,
+			value:    res,
+			startBit: bitFromIndex,
+			// endBit:   7,
+		})
 
-	indexes, err := b.getReccurentRowsIDs(m.rule)
-	if err != nil {
-		return nil, err
+		// if period longer than 2 bytes
+		for i := 1; i < byteToIndex-byteFromIndex; i++ {
+			expectedBytes = append(expectedBytes, ByteInfo{
+				index:    byteFromIndex + i,
+				value:    byte(255),
+				startBit: 0,
+				// endBit:   7,
+			})
+		}
+
+		res = byte(1)
+		for i := 0; i < bitToIndex; i++ {
+			res = res << 1
+			res = res + byte(1)
+		}
+		// now we have 00000011
+		res = res << byte(bitsLen-bitToIndex-1)
+		// now we have 11000000
+		expectedBytes = append(expectedBytes, ByteInfo{
+			index:    byteToIndex,
+			value:    res,
+			startBit: 0,
+			// endBit:   bitToIndex,
+		})
 	}
-	return indexes, nil
+	return expectedBytes
 }
 
-func (b *Busyness) bookTimeSlot(rows []int, columnsInterval pairInt) bool {
+func (b *Busyness) bookTimeSlot(bytesInfo []ByteInfo) (bool, error) {
 	defer b.rwLock.Unlock()
 	b.rwLock.Lock()
 
-	// O(days*intervals)*2
-	// intervals max value is 48 for 30min minInterval
-	// days max value is 90 for 3 months stored period
-	for _, i := range rows {
-		for j := columnsInterval[0]; j <= columnsInterval[1]; j++ {
-			if b.value[i][j] == 1 {
-				return false
-			}
+	if len(bytesInfo) == 0 {
+		return false, errors.New("empty bytes array")
+	}
+
+	for _, info := range bytesInfo {
+		if info.index >= len(b.value) {
+			break
+		}
+		if b.value[info.index]&info.value != 0 {
+			return false, nil
 		}
 	}
-	for _, i := range rows {
-		for j := columnsInterval[0]; j <= columnsInterval[1]; j++ {
-			b.value[i][j] = 1
+	for _, info := range bytesInfo {
+		if info.index >= len(b.value) {
+			break
 		}
+		b.value[info.index] = b.value[info.index] | info.value
 	}
-	return true
+	return true, nil
 }
 
-func (b *Busyness) checkTimeSlot(rows []int, columnsInterval pairInt) bool {
+func (b *Busyness) checkTimeSlot(bytesInfo []ByteInfo) (bool, error) {
 	defer b.rwLock.RUnlock()
 	b.rwLock.RLock()
 
-	// O(days*intervals)*2
-	// intervals max value is 48 for 30min minInterval
-	// days max value is 90 for 3 months stored period
-	for _, i := range rows {
-		for j := columnsInterval[0]; j <= columnsInterval[1]; j++ {
-			if b.value[i][j] == 1 {
-				return false
-			}
+	if len(bytesInfo) == 0 {
+		return false, errors.New("empty bytes array")
+	}
+
+	for _, info := range bytesInfo {
+		if info.index >= len(b.value) {
+			break
+		}
+		if b.value[info.index]&info.value != 0 {
+			return false, nil
 		}
 	}
-	return true
+	return true, nil
 }
 
 type Meeting struct {
@@ -200,60 +264,151 @@ func (b *Busyness) AppendDay(meetings []Meeting) error {
 	defer b.rwLock.Unlock()
 	b.rwLock.Lock()
 
-	columnsIndexesToChange := make([]int, 0)
+	bytesInfo := make([]ByteInfo, 0)
 	for _, m := range meetings {
-		columnsInterval, getColumnsErr := b.getColumnsInterval(&m)
-		if getColumnsErr != nil {
-			return getColumnsErr
+		meetingLength, getMLengthErr := b.getMeetingLength(&m)
+		if getMLengthErr != nil {
+			return getMLengthErr
 		}
-		for i := columnsInterval[0]; i <= columnsInterval[1]; i++ {
-			columnsIndexesToChange = append(columnsIndexesToChange, i)
+
+		if meetingLength == 0 {
+			continue
 		}
+
+		fromIndex := b.getBitIndex(m.from)
+		bytesInfo = append(bytesInfo, convertToBytes([]int{fromIndex}, meetingLength)...)
 	}
 
-	if len(columnsIndexesToChange) > b.getColumnsLen() {
-		return errors.New("impossible situation")
-	}
+	newDay := make([]byte, b.dayBytesLen)
+	b.value = append(b.value, newDay...)
 
-	newRow := make([]byte, b.getColumnsLen())
-	for _, ind := range columnsIndexesToChange {
-		if ind >= len(newRow) || ind < 0 {
-			return errors.New("wrong index to change")
+	for _, info := range bytesInfo {
+		if info.index >= len(b.value) {
+			continue
 		}
-		if newRow[ind] == 1 {
+		if b.value[info.index]&info.value != 0 {
 			return errors.New("crossing events")
 		}
-		newRow[ind] = 1
+		b.value[info.index] = b.value[info.index] | info.value
 	}
 
-	b.value = append(b.value, newRow)
-	b.value = b.value[1:]
+	b.value = b.value[b.dayBytesLen:]
+	b.startDate = b.startDate.Add(24 * time.Hour)
 	return nil
 }
 
-type pairInt [2]int
-
-func (b *Busyness) getPossiblePairs(currentIndex int, startPair pairInt) []pairInt {
-	result := make([]pairInt, 0)
-	i := 1
-	withLeft := startPair[0]-i > currentIndex
-	// O(n)
-	for (startPair[1]+i < b.getColumnsLen()) || (startPair[0]-i >= 0) {
-		if withLeft && (startPair[0]-i >= 0) {
-			leftPair := pairInt{startPair[0] - i, startPair[1] - i}
-			result = append(result, leftPair)
-
-			withLeft = startPair[0]-(i+1) > currentIndex
-		}
-
-		if startPair[1]+i < b.getColumnsLen() {
-			rightPair := pairInt{startPair[0] + i, startPair[1] + i}
-			result = append(result, rightPair)
-		}
-
-		i += 1
+func getBitsPositions(byteIndex int, v byte) []int {
+	if v == 0 {
+		return []int{}
 	}
-	return result
+
+	checkValues := []byte{1, 2, 4, 8, 16, 32, 64, 128}
+	positions := make([]int, 0, 8)
+	defaultIncrement := byteIndex * bitsLen
+	for i, checkValue := range checkValues {
+		if v&checkValue != 0 {
+			positions = append(positions, defaultIncrement+(bitsLen-1-i))
+		}
+	}
+	return positions
+}
+
+func (b *Busyness) GetBusyness(period time.Duration) []Meeting {
+	defer b.rwLock.RUnlock()
+	b.rwLock.RLock()
+
+	byteIndex, bitIndex := getByteIndexes(int(period / b.interval))
+	if bitIndex != 0 {
+		byteIndex += 1
+	}
+	if byteIndex >= len(b.value) {
+		byteIndex = len(b.value) - 1
+	}
+
+	bitsIndexes := make([]int, 0)
+	for i := 0; i <= byteIndex; i++ {
+		currentByte := b.value[i]
+		bitsIndexes = append(bitsIndexes, getBitsPositions(i, currentByte)...)
+	}
+	sort.Ints(bitsIndexes) // assume later that it's sorted O(nlogn)
+
+	meetings := make([]Meeting, 0)
+	// O(n)
+	var prevTo time.Time
+	for _, index := range bitsIndexes {
+		from := b.getTimeFromIndex(index)
+		to := from.Add(b.interval)
+
+		if len(meetings) == 0 {
+			meetings = append(meetings, Meeting{
+				from: from,
+				to:   to,
+			})
+			prevTo = to
+			continue
+		}
+
+		if from.Equal(prevTo) {
+			meetings[len(meetings)-1].to = to
+			prevTo = to
+			continue
+		}
+
+		meetings = append(meetings, Meeting{
+			from: from,
+			to:   to,
+		})
+		prevTo = to
+	}
+	return meetings
+}
+
+// func (b *Busyness) getPossibleConfigurations(from time.Time, startIndexes []int, meetingLength int) [][]ByteInfo {
+// 	year, month, day := from.Date()
+// 	nextDay := time.Date(year, month, day+1, 0, 0, 0, 0, from.Location())
+
+// 	fromIndex := b.getBitIndex(from)
+// 	toIndex := b.getBitIndex(nextDay)
+// 	// until next day
+// 	withLeftShift := startIndexes[0] > fromIndex
+// 	withRightShift := startIndexes[0]+meetingLength < toIndex
+
+// 	possibleConfigurations := make([][]ByteInfo, 0)
+// 	// todo
+// 	return possibleConfigurations
+// }
+
+func (b *Busyness) getMeetingFromBytes(bytesInfo []ByteInfo) (Meeting, error) {
+	bitsIndexes := make([]int, 0)
+	for _, info := range bytesInfo {
+		bitsIndexes = append(bitsIndexes, getBitsPositions(info.index, info.value)...)
+	}
+	sort.Ints(bitsIndexes) // assume later that it's sorted O(nlogn)
+
+	// remove duplicates
+	cleanedIndexes := make([]int, 0, len(bitsIndexes))
+	for i := 0; i < len(bitsIndexes)-1; i++ {
+		if bitsIndexes[i] == bitsIndexes[i+1] {
+			continue
+		}
+		cleanedIndexes = append(cleanedIndexes, bitsIndexes[i])
+	}
+
+	if len(cleanedIndexes) == 0 {
+		return Meeting{}, errors.New("empty indexes list")
+	}
+
+	for i, index := range cleanedIndexes {
+		if index == cleanedIndexes[0]+i {
+			continue
+		}
+
+		return Meeting{
+			from: b.getTimeFromIndex(cleanedIndexes[0]),
+			to:   b.getTimeFromIndex(index),
+		}, nil
+	}
+	return Meeting{}, nil
 }
 
 func (b *Busyness) BookOrGetAvailableSlots(m *Meeting, maxNumber int) (bool, []Meeting, error) {
@@ -261,23 +416,26 @@ func (b *Busyness) BookOrGetAvailableSlots(m *Meeting, maxNumber int) (bool, []M
 	// todo: validate that reccurent event from and to happen in one day
 	// todo: validate that from < to, from > time.Now
 
-	// time slots
-	columnsInterval, getColumnsErr := b.getColumnsInterval(m)
-	if getColumnsErr != nil {
-		return false, nil, getColumnsErr
+	meetingLength, getMLengthErr := b.getMeetingLength(m) // O(1)
+	if getMLengthErr != nil {
+		return false, nil, getMLengthErr
 	}
 
-	// days
-	rows, getRowsErr := b.getRowsIndexes(m)
-	if getRowsErr != nil {
-		return false, nil, getRowsErr
+	startIndexes, getIndexes := b.getStartIndexes(m) // depends on the rrule lib
+	if getIndexes != nil {
+		return false, nil, getIndexes
 	}
+	sort.Ints(startIndexes) // assume later that array is sorted - O
 
-	if len(rows) == 0 {
+	if meetingLength == 0 {
 		return false, nil, errors.New("empty period")
 	}
 
-	bookStatus := b.bookTimeSlot(rows, columnsInterval)
+	bytesInfo := convertToBytes(startIndexes, meetingLength) // O(n*8)
+	bookStatus, bookErr := b.bookTimeSlot(bytesInfo)         // O(n)
+	if bookErr != nil {
+		return false, nil, bookErr
+	}
 	if bookStatus {
 		return true, nil, nil
 	}
@@ -287,34 +445,36 @@ func (b *Busyness) BookOrGetAvailableSlots(m *Meeting, maxNumber int) (bool, []M
 		return false, nil, nil
 	}
 
-	currentIndex := -1
-	if isEqualDate(time.Now(), m.from) {
-		// the same day
-		currentIndex = b.getColumnIndex(time.Now())
-	}
+	// dont need to find time slots in the past
+	// fromTime := m.from
+	// if isEqualDate(m.from, time.Now()) {
+	// 	fromTime = time.Now()
+	// }
+	// possibleConfigurations := b.getPossibleConfigurations(fromTime, startIndexes, meetingLength)
+	// possibleMeetings := make([]Meeting, 0)
+	// for _, bytesInfo := range possibleConfigurations {
+	// 	// bytesInfo := convertToBytes(indexes, meetingLength)
+	// 	chekStatus, checkErr := b.checkTimeSlot(bytesInfo)
+	// 	if checkErr != nil {
+	// 		return false, nil, checkErr
+	// 	}
+	// 	if chekStatus {
+	// 		newMeeting, getMeetingErr := b.getMeetingFromBytes(bytesInfo)
+	// 		if getMeetingErr != nil {
+	// 			return false, nil, getMeetingErr
+	// 		}
+	// 		if m.rule != nil {
+	// 			newRule := *m.rule
+	// 			newRule.DTStart(newMeeting.from)
+	// 			newMeeting.rule = &newRule
+	// 		}
 
-	possibleIntervals := b.getPossiblePairs(currentIndex, columnsInterval)
+	// 		possibleMeetings = append(possibleMeetings, newMeeting)
+	// 	}
 
-	possibleMeetings := make([]Meeting, 0)
-	for _, interval := range possibleIntervals {
-		chekStatus := b.checkTimeSlot(rows, interval)
-		if chekStatus {
-			newMeeting := Meeting{
-				from: b.getTimeFromRowColumn(rows[0], interval[0]),
-				to:   b.getTimeFromRowColumn(rows[0], interval[1]+1),
-			}
-			if m.rule != nil {
-				newRule := *m.rule
-				newRule.DTStart(newMeeting.from)
-				newMeeting.rule = &newRule
-			}
-
-			possibleMeetings = append(possibleMeetings, newMeeting)
-		}
-
-		if len(possibleMeetings) == maxNumber {
-			return false, possibleMeetings, nil
-		}
-	}
-	return false, possibleMeetings, nil
+	// 	if len(possibleMeetings) == maxNumber {
+	// 		return false, possibleMeetings, nil
+	// 	}
+	// }
+	return false, []Meeting{}, nil
 }
